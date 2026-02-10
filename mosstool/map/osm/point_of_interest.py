@@ -3,6 +3,8 @@ from typing import Optional
 
 import requests
 from geojson import Feature, FeatureCollection, Point, dump
+import duckdb
+import pandas as pd
 
 from .._map_util.format_checker import osm_format_checker
 
@@ -45,6 +47,7 @@ class PointOfInterest:
 
         # generate POIs
         self.pois: list = []
+        self.con = duckdb.connect(database=":memory:")
 
     def _query_raw_data(self, osm_data_cache: Optional[list[dict]] = None):
         """
@@ -106,8 +109,11 @@ class PointOfInterest:
         for d in self._nodes:
             d_tags = d.get("tags", {})
             p_name = d_tags.get("name", "")
+            p_address = d_tags.get("address", "")
+
             # name
             d["name"] = p_name
+            d["address"] = p_address
             # catg
             if "landuse" in d_tags:
                 value = d_tags["landuse"]
@@ -141,27 +147,300 @@ class PointOfInterest:
         logging.info(f"raw poi: {len(_raw_pois)}")
         self.pois = _raw_pois
 
+    def _query_pois_from_overture(self, confidence_filter: float = 0.8):
+        """
+        Query POIs from Overture Maps API.
+
+        Args:
+        - confidence_filter (float): confidence filter for POIs.
+
+        Returns:
+        - List of POI dictionaries
+        """
+        logging.info(
+            f"Querying POIs from Overture Maps in bbox: {self.bbox} with confidence filter: {confidence_filter}"
+        )
+
+        try:
+            self.con.sql("INSTALL httpfs;")
+            self.con.sql("INSTALL spatial;")
+
+            result = self.con.sql(
+                f"""
+              LOAD spatial;
+              LOAD httpfs;
+
+              -- Access the data on AWS
+              SET s3_region='us-west-2';
+
+              SELECT 
+                id,
+                names.primary as name,
+                basic_category as catg,
+                ST_X(geometry) as lon,
+                ST_Y(geometry) as lat,
+                COALESCE(addresses[1].freeform, '') as address,
+                confidence,
+                sources
+              FROM read_parquet('s3://overturemaps-us-west-2/release/2026-01-21.0/theme=places/type=place/*')
+              WHERE 
+                  confidence >= {confidence_filter}
+                  -- Filter by actual point geometry, not bbox
+                  AND ST_X(geometry) BETWEEN {self.bbox[1]} AND {self.bbox[3]}
+                  AND ST_Y(geometry) BETWEEN {self.bbox[0]} AND {self.bbox[2]}
+              """
+            ).fetchall()
+
+            logging.info(f"Found {len(result)} POIs from Overture Maps")
+
+            # Convert to the expected format
+            pois = []
+            for row in result:
+                pois.append(
+                    {
+                        "id": row[0],
+                        "name": row[1] or "",
+                        "catg": row[2] or "unknown",
+                        "lon": row[3],
+                        "lat": row[4],
+                        "address": row[5] or "",
+                        "tags": {"confidence": row[6]},
+                    }
+                )
+
+            return pois
+
+        except Exception as e:
+            logging.error(f"Error querying Overture Maps: {e}")
+            raise
+
+    def _merge_overture_and_osm_pois(
+        self,
+        overture_pois: list[dict],
+        osm_pois: list[dict],
+    ) -> list[dict]:
+        """
+        Merge POIs from Overture Maps and OSM data.
+
+        Args:
+        - overture_pois (list[dict]): List of POIs from Overture Maps.
+        - osm_pois (list[dict]): List of POIs from OSM data.
+
+        Returns:
+        - Merged list of POIs.
+        """
+        self.con.sql("INSTALL h3 FROM community")
+        self.con.sql("LOAD h3")
+
+        logging.info(f"\n\n\n\nOverture POIs: {overture_pois[:5]}")
+        logging.info(f"\n\n\n\nOSM POIs: {osm_pois[:5]}")
+
+        flattened_overture_pois = [
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "catg": p["catg"],
+                "lon": p["lon"],
+                "lat": p["lat"],
+                "address": p.get("address", ""),
+            }
+            for p in overture_pois
+        ]
+
+        # Convert to pandas DataFrame and register with DuckDB
+        overture_df = pd.DataFrame(flattened_overture_pois)
+
+        if overture_df.empty:
+            logging.warning("No Overture POIs to merge, returning OSM POIs only.")
+            return osm_pois
+
+        self.con.sql(
+            """
+            CREATE TABLE overture_pois AS 
+            SELECT *, h3_latlng_to_cell(lat, lon, 10) AS h3_index 
+            FROM overture_df
+        """
+        )
+
+        flattened_osm_pois = [
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "catg": p["catg"],
+                "lon": p["lon"],
+                "lat": p["lat"],
+                "address": p.get("address", ""),
+            }
+            for p in osm_pois
+        ]
+
+        # Convert to pandas DataFrame and register with DuckDB
+        osm_df = pd.DataFrame(flattened_osm_pois)
+
+        if osm_df.empty:
+            logging.warning("No OSM POIs to merge, returning Overture POIs only.")
+            return overture_pois
+
+        self.con.sql(
+            """
+            CREATE TABLE osm_pois AS 
+            SELECT *, h3_latlng_to_cell(lat, lon, 10) AS h3_index 
+            FROM osm_df
+        """
+        )
+
+        similar_samples = self.con.sql(
+        """
+        SELECT o.id, o.name, o.catg, osm.id, osm.name, osm.catg,
+              jaro_winkler_similarity(LOWER(TRIM(o.name)), LOWER(TRIM(osm.name))) as similarity
+        FROM overture_pois o
+        JOIN osm_pois osm
+        ON o.h3_index = osm.h3_index
+        WHERE jaro_winkler_similarity(LOWER(TRIM(o.name)), LOWER(TRIM(osm.name))) >= 0.9
+        ORDER BY similarity DESC
+        LIMIT 5
+        """
+        ).fetchall()
+
+        count_similar_names = self.con.sql(
+            """
+        SELECT COUNT(*) AS count
+        FROM overture_pois o
+        JOIN osm_pois osm
+        ON o.h3_index = osm.h3_index
+        WHERE jaro_winkler_similarity(LOWER(TRIM(o.name)), LOWER(TRIM(osm.name))) >= 0.9
+        """
+        ).fetchall()
+
+        logging.info(
+            f"Found {count_similar_names[0][0]} similar POIs between Overture and OSM. Sample: {similar_samples[:2]}"
+        )
+
+        # Remove exact name matches based on h3 index and name
+        # Preprocess names to lower case and trim spaces
+        self.con.sql(
+            """
+        DELETE FROM osm_pois
+        WHERE EXISTS (
+            SELECT 1
+            FROM overture_pois o
+            WHERE osm_pois.h3_index = o.h3_index
+            AND jaro_winkler_similarity(LOWER(TRIM(o.name)), LOWER(TRIM(osm_pois.name))) >= 0.9
+        )             
+        """
+        )
+
+        similar_samples_based_address = self.con.sql(
+        """
+        SELECT o.id, o.name, o.catg, osm.id, osm.name, osm.catg,
+              jaro_winkler_similarity(LOWER(TRIM(o.name)), LOWER(TRIM(osm.name))) as similarity,
+              jaro_winkler_similarity(LOWER(TRIM(o.address)), LOWER(TRIM(osm.address))) as address_similarity
+        FROM overture_pois o
+        JOIN osm_pois osm
+        ON o.h3_index = osm.h3_index
+        WHERE jaro_winkler_similarity(LOWER(TRIM(o.name)), LOWER(TRIM(osm.name))) >= 0.75 AND o.address != '' AND osm.address != '' AND jaro_winkler_similarity(LOWER(TRIM(o.address)), LOWER(TRIM(osm.address))) >= 0.75
+        ORDER BY similarity DESC
+        LIMIT 5
+        """
+        ).fetchall()
+
+        count_similar_samples_based_address = self.con.sql(
+            """
+        SELECT COUNT(*) AS count
+        FROM overture_pois o
+        JOIN osm_pois osm
+        ON o.h3_index = osm.h3_index
+        WHERE jaro_winkler_similarity(LOWER(TRIM(o.name)), LOWER(TRIM(osm.name))) >= 0.75 AND o.address != '' AND osm.address != '' AND jaro_winkler_similarity(LOWER(TRIM(o.address)), LOWER(TRIM(osm.address))) >= 0.75
+        """
+        ).fetchall()
+
+        logging.info(
+            f"Found {count_similar_samples_based_address[0][0]} similar POIs between Overture and OSM (using name + address). Sample: {similar_samples_based_address[:2]}"
+        )
+
+        self.con.sql(
+            """
+        DELETE FROM osm_pois
+        WHERE EXISTS (
+            SELECT 1
+            FROM overture_pois o
+            WHERE osm_pois.h3_index = o.h3_index
+            AND jaro_winkler_similarity(LOWER(TRIM(o.name)), LOWER(TRIM(osm_pois.name))) >= 0.75
+            AND o.address != '' AND osm_pois.address != '' AND jaro_winkler_similarity(LOWER(TRIM(o.address)), LOWER(TRIM(osm_pois.address))) >= 0.75
+        )             
+        """
+        )
+
+        final_pois = self.con.sql(
+            """
+        SELECT id, name, catg, lon, lat  FROM overture_pois
+        UNION ALL
+        SELECT id, name, catg, lon, lat FROM osm_pois
+        """
+        ).fetchall()
+
+        # Convert back to list of dicts
+        merged_pois = []
+        for row in final_pois:
+            merged_pois.append(
+                {
+                    "id": row[0],
+                    "name": row[1],
+                    "catg": row[2],
+                    "lon": row[3],
+                    "lat": row[4],
+                    "tags": {},
+                }
+            )
+
+        logging.info(f"Total merged POIs: {len(merged_pois)}")
+        return merged_pois
+
     def create_pois(
         self,
         output_path: Optional[str] = None,
         osm_data_cache: Optional[list[dict]] = None,
         osm_cache_check: bool = False,
+        use_overture_maps: bool = False,
+        merge_data: bool = False,
+        confidence_filter: float = 0.8,
     ):
         """
-        Create POIs from OpenStreetMap.
+        Create POIs from OpenStreetMap or Overture Maps.
 
         Args:
         - osm_data_cache (Optional[list[dict]]): OSM data cache.
         - output_path (str): GeoJSON file output path.
         - osm_cache_check (bool): check the format of input OSM data cache.
-
+        - use_overture_maps (bool): whether to use Overture Maps for POIs.
+        - confidence_filter (float): confidence filter for POIs.
         Returns:
         - POIs in GeoJSON format.
         """
-        osm_format_checker(osm_cache_check, osm_data_cache, {"node": ["lon", "lat"]})
-        self._query_raw_data(osm_data_cache)
-        self._make_raw_poi()
+        if use_overture_maps:
+            overture_pois = self._query_pois_from_overture(
+                confidence_filter=confidence_filter
+            )
+            logging.info(f"Overture POIs: {len(overture_pois)}")
+            self.pois = overture_pois
+        
+        if (not use_overture_maps) or merge_data:
+            logging.info(f"Getting POIs from OSM data")
+            osm_format_checker(
+                osm_cache_check, osm_data_cache, {"node": ["lon", "lat"]}
+            )
+            self._query_raw_data(osm_data_cache)
+            self._make_raw_poi()
+            
+
+        if merge_data:
+            self.pois = self._merge_overture_and_osm_pois(
+                overture_pois=overture_pois, osm_pois=self.pois
+            )
+
         geos = []
+        logging.info("Generating POI geojson")
+        logging.info(f"\npoi: {len(self.pois)}")
         for poi_id, poi in enumerate(self.pois):
             geos.append(
                 Feature(

@@ -234,20 +234,26 @@ def _merge_point_aoi(
             tree = KDTree(block_poi_xys)
             visited_pid = set()
 
-            def find_neighbor(pid):
-                visited_pid.add(pid)
-                p_xy = block_poi_xys[pid]
-                # KDTree Find nearby poi
-                for near_pid in tree.query_ball_point(p_xy, MERGE_GATE):  # type: ignore
-                    if near_pid in visited_pid:
-                        continue
-                    father_id[near_pid] = pid
-                    find_neighbor(near_pid)
+            def find_neighbor_iterative(start_pid):
+                """Iterative version to avoid recursion depth issues"""
+                stack = [start_pid]
+                visited_pid.add(start_pid)
+                
+                while stack:
+                    pid = stack.pop()
+                    p_xy = block_poi_xys[pid]
+                    # KDTree Find nearby poi
+                    for near_pid in tree.query_ball_point(p_xy, MERGE_GATE):  # type: ignore
+                        if near_pid in visited_pid:
+                            continue
+                        visited_pid.add(near_pid)
+                        father_id[near_pid] = pid
+                        stack.append(near_pid)
 
             for pid, _ in enumerate(block_poi):
                 if pid in visited_pid:
                     continue
-                find_neighbor(pid)
+                find_neighbor_iterative(pid)
 
             for pid in range(len(block_poi)):
                 while father_id[pid] != father_id[father_id[pid]]:
