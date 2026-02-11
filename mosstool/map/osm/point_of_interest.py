@@ -3,7 +3,7 @@ from typing import Optional
 
 import requests
 from geojson import Feature, FeatureCollection, Point, dump
-import duckdb
+from ...spatial_db.spatial_db import SpatialDB
 import pandas as pd
 
 from .._map_util.format_checker import osm_format_checker
@@ -47,7 +47,7 @@ class PointOfInterest:
 
         # generate POIs
         self.pois: list = []
-        self.con = duckdb.connect(database=":memory:")
+        self.sp_db = SpatialDB()
 
     def _query_raw_data(self, osm_data_cache: Optional[list[dict]] = None):
         """
@@ -162,10 +162,7 @@ class PointOfInterest:
         )
 
         try:
-            self.con.sql("INSTALL httpfs;")
-            self.con.sql("INSTALL spatial;")
-
-            result = self.con.sql(
+            result = self.sp_db.execute(
                 f"""
               LOAD spatial;
               LOAD httpfs;
@@ -229,9 +226,6 @@ class PointOfInterest:
         Returns:
         - Merged list of POIs.
         """
-        self.con.sql("INSTALL h3 FROM community")
-        self.con.sql("LOAD h3")
-
         logging.info(f"\n\n\n\nOverture POIs: {overture_pois[:5]}")
         logging.info(f"\n\n\n\nOSM POIs: {osm_pois[:5]}")
 
@@ -254,7 +248,10 @@ class PointOfInterest:
             logging.warning("No Overture POIs to merge, returning OSM POIs only.")
             return osm_pois
 
-        self.con.sql(
+        # Register the DataFrame with DuckDB
+        self.sp_db.con.register("overture_df", overture_df)
+
+        self.sp_db.execute(
             """
             CREATE TABLE overture_pois AS 
             SELECT *, h3_latlng_to_cell(lat, lon, 10) AS h3_index 
@@ -281,7 +278,10 @@ class PointOfInterest:
             logging.warning("No OSM POIs to merge, returning Overture POIs only.")
             return overture_pois
 
-        self.con.sql(
+        # Register the DataFrame with DuckDB
+        self.sp_db.con.register("osm_df", osm_df)
+
+        self.sp_db.execute(
             """
             CREATE TABLE osm_pois AS 
             SELECT *, h3_latlng_to_cell(lat, lon, 10) AS h3_index 
@@ -289,8 +289,8 @@ class PointOfInterest:
         """
         )
 
-        similar_samples = self.con.sql(
-        """
+        similar_samples = self.sp_db.execute(
+            """
         SELECT o.id, o.name, o.catg, osm.id, osm.name, osm.catg,
               jaro_winkler_similarity(LOWER(TRIM(o.name)), LOWER(TRIM(osm.name))) as similarity
         FROM overture_pois o
@@ -302,7 +302,7 @@ class PointOfInterest:
         """
         ).fetchall()
 
-        count_similar_names = self.con.sql(
+        count_similar_names = self.sp_db.execute(
             """
         SELECT COUNT(*) AS count
         FROM overture_pois o
@@ -318,7 +318,7 @@ class PointOfInterest:
 
         # Remove exact name matches based on h3 index and name
         # Preprocess names to lower case and trim spaces
-        self.con.sql(
+        self.sp_db.execute(
             """
         DELETE FROM osm_pois
         WHERE EXISTS (
@@ -330,8 +330,8 @@ class PointOfInterest:
         """
         )
 
-        similar_samples_based_address = self.con.sql(
-        """
+        similar_samples_based_address = self.sp_db.execute(
+            """
         SELECT o.id, o.name, o.catg, osm.id, osm.name, osm.catg,
               jaro_winkler_similarity(LOWER(TRIM(o.name)), LOWER(TRIM(osm.name))) as similarity,
               jaro_winkler_similarity(LOWER(TRIM(o.address)), LOWER(TRIM(osm.address))) as address_similarity
@@ -344,7 +344,7 @@ class PointOfInterest:
         """
         ).fetchall()
 
-        count_similar_samples_based_address = self.con.sql(
+        count_similar_samples_based_address = self.sp_db.execute(
             """
         SELECT COUNT(*) AS count
         FROM overture_pois o
@@ -358,7 +358,7 @@ class PointOfInterest:
             f"Found {count_similar_samples_based_address[0][0]} similar POIs between Overture and OSM (using name + address). Sample: {similar_samples_based_address[:2]}"
         )
 
-        self.con.sql(
+        self.sp_db.execute(
             """
         DELETE FROM osm_pois
         WHERE EXISTS (
@@ -371,7 +371,7 @@ class PointOfInterest:
         """
         )
 
-        final_pois = self.con.sql(
+        final_pois = self.sp_db.execute(
             """
         SELECT id, name, catg, lon, lat  FROM overture_pois
         UNION ALL
@@ -423,7 +423,7 @@ class PointOfInterest:
             )
             logging.info(f"Overture POIs: {len(overture_pois)}")
             self.pois = overture_pois
-        
+
         if (not use_overture_maps) or merge_data:
             logging.info(f"Getting POIs from OSM data")
             osm_format_checker(
@@ -431,7 +431,6 @@ class PointOfInterest:
             )
             self._query_raw_data(osm_data_cache)
             self._make_raw_poi()
-            
 
         if merge_data:
             self.pois = self._merge_overture_and_osm_pois(

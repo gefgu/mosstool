@@ -213,12 +213,28 @@ class Building:
         invalid_relation_cnt = 0
         for rid, rel in rels_dict.items():
             t = {"outer": [], "inner": []}
+            missing_ways = []  # Track missing ways
+            
             for x in rel["members"]:
                 wid, role = x["ref"], x["role"]
+                
+                # Skip if way doesn't exist in ways_rel_dict
+                if wid not in ways_rel_dict:
+                    missing_ways.append(wid)
+                    continue
+                    
                 if role not in {"inner", "outer"}:
                     invalid_relation_cnt += 1
                     break
                 t[role].append(wid)
+            
+            # Skip this relation if critical ways are missing
+            if missing_ways:
+                if not t["outer"]:  # Only warn if outer ways are missing
+                    logging.debug(f"Skipping relation {rid}: missing {len(missing_ways)} way(s)")
+                invalid_relation_cnt += 1
+                continue
+            
             if not t["outer"]:
                 continue
 

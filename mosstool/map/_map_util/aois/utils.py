@@ -7,7 +7,10 @@ from typing import Any
 import shapely.ops as ops
 from shapely.affinity import scale
 from shapely.geometry import MultiPoint, MultiPolygon, Point, Polygon
+from shapely.strtree import STRtree
 from tqdm import tqdm
+
+from ....spatial_db.spatial_db import SpatialDB
 
 from ..const import *
 
@@ -315,7 +318,6 @@ def _match_poi_unit(partial_args: tuple[list[dict[str, Any]]], poi: dict[str, An
             if point.covered_by(aoi["geo"]):
                 parent = i
                 break
-            # elif not covered:
             else:  # If not covered, try to project to adjacent aoi
                 dis = point.distance(aoi["geo"])
                 if dis < DIS_GATE:
@@ -356,31 +358,19 @@ def _process_stops(stops):
 def _match_poi_to_aoi(
     aois: list[dict[str, Any]],
     pois: list[dict[str, Any]],
-    enable_tqdm: bool,
-    workers: int,
-    max_chunk_size: int,
 ):
     """
     poi matches aoi:
     Directly dependent items covered by existing aoi go in
     Those that are not covered, such as bus stations, become new aoi; non-bus stations are subordinate to the nearest aoi within a certain distance; those that are too far away from the existing aoi become new aoi
     """
-    # Calculate whether each poi is covered. If not, calculate the projection onto the nearest aoi.
     logging.info(f"Multiprocessing for matching poi({len(pois)}) to aoi({len(aois)})")
-    results = []
-    aois_to_match_poi = aois
-    partial_match_poi_unit = partial(_match_poi_unit, (aois_to_match_poi,))
-    for i in tqdm(range(0, len(pois), MAX_BATCH_SIZE), disable=not enable_tqdm):
-        pois_batch = pois[i : i + MAX_BATCH_SIZE]
-        with Pool(processes=workers) as pool:
-            results += pool.map(
-                partial_match_poi_unit,
-                pois_batch,
-                chunksize=max(
-                    min(ceil(len(pois_batch) / workers), max_chunk_size),
-                    1,
-                ),
-            )
+
+    logging.info(f"Sample poi: {pois[:2]}.\n\n Sample aoi: {aois[:2]}")
+
+    sp_db = SpatialDB()
+    results = sp_db.match_pois_to_aois(pois, aois, distance_threshold=1000)
+
     pois_covered = []
     pois_projected = []
     pois_isolate = []
@@ -446,9 +436,6 @@ def generate_aoi_poi(
     aois_add_poi, pois_isolate, pois_output = _match_poi_to_aoi(
         aois=input_aois,
         pois=input_pois,
-        workers=workers,
-        enable_tqdm=enable_tqdm,
-        max_chunk_size=multiprocessing_chunk_size,
     )
     # Convert format to output
     aois_output = _post_compute_aoi_poi(aois_add_poi, pois_isolate)
@@ -473,9 +460,6 @@ def generate_sumo_aoi_poi(
     aois_add_poi, pois_isolate, pois_output = _match_poi_to_aoi(
         aois=input_aois,
         pois=input_pois,
-        enable_tqdm=enable_tqdm,
-        workers=workers,
-        max_chunk_size=multiprocessing_chunk_size,
     )
     aois_output = _post_compute_aoi_poi(aois_add_poi, pois_isolate)
     stops_output = _process_stops(input_stops)
