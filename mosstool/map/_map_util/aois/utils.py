@@ -369,7 +369,7 @@ def _match_poi_to_aoi(
     logging.info(f"Sample poi: {pois[:2]}.\n\n Sample aoi: {aois[:2]}")
 
     sp_db = SpatialDB()
-    results = sp_db.match_pois_to_aois(pois, aois, distance_threshold=1000)
+    results = sp_db.match_pois_to_aois(pois, aois, distance_threshold=500)
 
     pois_covered = []
     pois_projected = []

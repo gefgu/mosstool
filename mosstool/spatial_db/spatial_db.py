@@ -4,10 +4,10 @@ import pandas as pd
 import tempfile
 import atexit
 import os
-
+from tqdm import tqdm
 
 class SpatialDB:
-    def __init__(self, memory_limit="32GB"):
+    def __init__(self, memory_limit="64GB"):
         # Create a temp file path but remove the empty file immediately
         self.fd, self.db_path = tempfile.mkstemp(suffix=".duckdb")
         os.close(self.fd)  # Close the file descriptor
@@ -37,10 +37,16 @@ class SpatialDB:
     def execute(self, query: str):
         return self.con.sql(query)
 
-    def _ingest_pois_and_aois(self, pois: list[dict], aois: list[dict]):
+    def _ingest_pois_and_aois(
+        self, pois: list[dict], aois: list[dict], simplify_tolerance: float = 1.0
+    ):
         """
         Ingest the pois and aois into the spatial database for efficient spatial queries.
         This is used for matching the pois to the aois.
+
+        Args:
+            simplify_tolerance: Tolerance for simplifying AOI geometries (meters).
+                            Higher values = more simplification = less memory.
         """
 
         # Extract only the data we need (exclude Shapely geometry objects)
@@ -91,7 +97,7 @@ class SpatialDB:
         """
         )
 
-        # Create AOI table with polygon geometries
+        # Create AOI table with simplified polygon geometries
         # We need to construct WKT POLYGON strings from the coords
         aois_with_wkt = []
         for aoi in aois:
@@ -108,13 +114,14 @@ class SpatialDB:
         aois_wkt_df = pd.DataFrame(aois_with_wkt)
         self.con.register("aois_wkt_df", aois_wkt_df)
 
+        # Simplify geometries to reduce memory usage
         self.con.execute(
-            """
+            f"""
         CREATE TABLE aois AS
         SELECT
             id,
             external,
-            ST_GeomFromText(wkt) AS geom
+            ST_Simplify(ST_GeomFromText(wkt), {simplify_tolerance}) AS geom
         FROM aois_wkt_df;
         """
         )
@@ -125,10 +132,10 @@ class SpatialDB:
 
         logging.info("Ingested POIs and AOIs into spatial database")
         logging.info(
-            f"POI sample: {self.con.execute('SELECT * FROM pois LIMIT 3;').fetchall()}"
+            f"POI count: {self.con.execute('SELECT COUNT(*) FROM pois;').fetchone()[0]}"
         )
         logging.info(
-            f"AOI sample: {self.con.execute('SELECT id, ST_AsText(geom), external FROM aois LIMIT 3;').fetchall()}"
+            f"AOI count: {self.con.execute('SELECT COUNT(*) FROM aois;').fetchone()[0]}"
         )
 
     def match_pois_to_aois(
@@ -136,10 +143,19 @@ class SpatialDB:
         pois: list[dict],
         aois: list[dict],
         distance_threshold: float = 18.0,
+        simplify_tolerance: float = 1.0,
+        batch_size: int = 10000,
     ):
         """
-        Matches POIs to AOIs using DuckDB spatial logic.
+        Matches POIs to AOIs using DuckDB spatial logic with batching.
         Replaces the iterative _match_poi_unit function.
+
+        Args:
+            pois: List of POI dictionaries
+            aois: List of AOI dictionaries
+            distance_threshold: Maximum distance for neighboring POIs
+            simplify_tolerance: Tolerance for simplifying AOI geometries
+            batch_size: Number of POIs to process per batch
 
         Returns:
             List of tuples:
@@ -147,73 +163,156 @@ class SpatialDB:
             - (poi_dict, aoi_index, 1) for neighboring/projected POIs
             - (poi_dict, 2) for isolated POIs
         """
-        self._ingest_pois_and_aois(pois, aois)
+        # Set memory-efficient settings
+        self.con.execute("SET preserve_insertion_order=false;")
 
-        # Step 1: Get POIs covered by AOIs (classification = 0)
-        covered_pois_result = self.execute(
-            """
-            SELECT p.id, a.id AS aoi_id
-            FROM pois p
-            JOIN aois a ON ST_Within(p.geom, a.geom)
-            """
-        ).fetchall()
+        self._ingest_pois_and_aois(pois, aois, simplify_tolerance=simplify_tolerance)
 
-        logging.info(f"Covered {len(covered_pois_result)} POIs by AOIs")
-
-        # Create set for fast lookup
-        covered_poi_ids = {poi_id for poi_id, _ in covered_pois_result}
-
-        # Step 2: Get neighboring POIs (within distance threshold but not covered)
-        neighboring_pois_result = self.execute(
-            f"""
-            SELECT p.id, a.id AS aoi_id, ST_Distance(p.geom, a.geom) as distance
-            FROM pois p
-            JOIN aois a ON ST_DWithin(p.geom, a.geom, {distance_threshold})
-            WHERE NOT ST_Within(p.geom, a.geom)
-            """
-        ).fetchall()
-
-        # Filter to find the closest AOI for each neighboring POI
-        poi_to_closest_aoi = {}
-        for poi_id, aoi_id, distance in neighboring_pois_result:
-            if (
-                poi_id not in poi_to_closest_aoi
-                or distance < poi_to_closest_aoi[poi_id][1]
-            ):
-                poi_to_closest_aoi[poi_id] = (aoi_id, distance)
-
-        neighboring_poi_ids = {poi_id for poi_id in poi_to_closest_aoi.keys()}
-
-        logging.info(f"Neighboring {len(neighboring_poi_ids)} POIs near AOIs")
-
-        # Create lookup dictionaries
         poi_dict = {poi["id"]: poi for poi in pois}
         aoi_id_to_index = {aoi["id"]: idx for idx, aoi in enumerate(aois)}
 
-        # Build results
-        results = []
+        all_results = []
 
-        # Add covered POIs: (poi_dict, aoi_index, 0)
-        for poi_id, aoi_id in covered_pois_result:
-            aoi_index = aoi_id_to_index[aoi_id]
-            results.append((poi_dict[poi_id], aoi_index, 0))
+        # Process in batches to reduce memory usage
+        total_pois = self.con.execute("SELECT COUNT(*) FROM pois").fetchone()[0]
+        logging.info(f"Processing {total_pois} POIs in batches of {batch_size}")
 
-        # Add neighboring POIs: (poi_dict, aoi_index, 1)
-        for poi_id, (aoi_id, _) in poi_to_closest_aoi.items():
-            aoi_index = aoi_id_to_index[aoi_id]
-            results.append((poi_dict[poi_id], aoi_index, 1))
+        for offset in tqdm(range(0, total_pois, batch_size), desc="Matching POIs to AOIs"):
+            logging.info(
+                f"Processing POI batch {offset} to {min(offset + batch_size, total_pois)}"
+            )
 
-        # Add POIs that weren't matched at all: (poi_dict, 2)
-        all_matched_ids = covered_poi_ids | neighboring_poi_ids
-        for poi in pois:
-            if poi["id"] not in all_matched_ids:
-                results.append((poi, 2))
+            # Step 1: Get covered POIs in this batch
+            covered_pois_result = self.execute(
+                f"""
+                WITH batch_pois AS (
+                    SELECT id, geom 
+                    FROM pois 
+                    ORDER BY id
+                    LIMIT {batch_size} OFFSET {offset}
+                ),
+                poi_aoi_coverage AS (
+                    SELECT p.id as poi_id, a.id AS aoi_id
+                    FROM batch_pois p
+                    JOIN aois a ON ST_Within(p.geom, a.geom)
+                ),
+                ranked_coverage AS (
+                    SELECT 
+                        poi_id, 
+                        aoi_id,
+                        ROW_NUMBER() OVER (PARTITION BY poi_id ORDER BY aoi_id) as rn
+                    FROM poi_aoi_coverage
+                )
+                SELECT poi_id, aoi_id
+                FROM ranked_coverage
+                WHERE rn = 1
+                """
+            ).fetchall()
 
-        logging.info(
-            f"Total matched POIs: {len(results)} (covered: {len(covered_pois_result)}, neighboring: {len(neighboring_poi_ids)}, isolated: {len(results) - len(covered_pois_result) - len(neighboring_poi_ids)})"
+            covered_poi_ids = {poi_id for poi_id, _ in covered_pois_result}
+
+            # Step 2: Get neighboring POIs in this batch
+            if covered_poi_ids:
+                covered_ids_str = ",".join(map(str, covered_poi_ids))
+                exclude_covered = f"AND p.id NOT IN ({covered_ids_str})"
+            else:
+                exclude_covered = ""
+
+            neighboring_pois_result = self.execute(
+                f"""
+                WITH batch_pois AS (
+                    SELECT id, geom 
+                    FROM pois 
+                    ORDER BY id
+                    LIMIT {batch_size} OFFSET {offset}
+                ),
+                poi_aoi_neighbors AS (
+                    SELECT p.id as poi_id, a.id AS aoi_id, ST_Distance(p.geom, a.geom) as distance
+                    FROM batch_pois p
+                    JOIN aois a ON ST_DWithin(p.geom, a.geom, {distance_threshold})
+                    WHERE NOT ST_Within(p.geom, a.geom)
+                    {exclude_covered}
+                ),
+                ranked_neighbors AS (
+                    SELECT 
+                        poi_id, 
+                        aoi_id, 
+                        distance,
+                        ROW_NUMBER() OVER (PARTITION BY poi_id ORDER BY distance) as rn
+                    FROM poi_aoi_neighbors
+                )
+                SELECT poi_id, aoi_id, distance
+                FROM ranked_neighbors
+                WHERE rn = 1
+                """
+            ).fetchall()
+
+            neighboring_poi_ids = {poi_id for poi_id, _, _ in neighboring_pois_result}
+
+            # Get batch POI IDs
+            batch_poi_ids = set(
+                self.execute(
+                    f"""
+                SELECT id FROM pois 
+                ORDER BY id
+                LIMIT {batch_size} OFFSET {offset}
+                """
+                ).fetchdf()["id"]
+            )
+
+            # Build batch results
+            batch_results = []
+
+            # Add covered POIs
+            for poi_id, aoi_id in covered_pois_result:
+                aoi_index = aoi_id_to_index[aoi_id]
+                batch_results.append((poi_dict[poi_id], aoi_index, 0))
+
+            # Add neighboring POIs
+            for poi_id, aoi_id, _ in neighboring_pois_result:
+                aoi_index = aoi_id_to_index[aoi_id]
+                batch_results.append((poi_dict[poi_id], aoi_index, 1))
+
+            # Add isolated POIs
+            matched_ids = covered_poi_ids | neighboring_poi_ids
+            for poi_id in batch_poi_ids:
+                if poi_id not in matched_ids:
+                    batch_results.append((poi_dict[poi_id], 2))
+
+            all_results.extend(batch_results)
+            logging.info(
+                f"Batch {offset//batch_size + 1}: {len(batch_results)} POIs processed"
+            )
+
+        # Verify no duplicates
+        poi_counts = {}
+        for result in all_results:
+            poi_id = result[0]["id"]
+            poi_counts[poi_id] = poi_counts.get(poi_id, 0) + 1
+
+        duplicates = {pid: count for pid, count in poi_counts.items() if count > 1}
+        if duplicates:
+            logging.error(f"Found {len(duplicates)} duplicate POI IDs in results")
+            # Remove duplicates, keeping first occurrence
+            seen = set()
+            all_results = [
+                r
+                for r in all_results
+                if not (r[0]["id"] in seen or seen.add(r[0]["id"]))
+            ]
+
+        covered_count = sum(1 for r in all_results if len(r) == 3 and r[2] == 0)
+        neighboring_count = sum(1 for r in all_results if len(r) == 3 and r[2] == 1)
+        isolated_count = sum(
+            1 for r in all_results if len(r) == 2 or (len(r) == 3 and r[2] == 2)
         )
 
-        return results
+        logging.info(
+            f"Total matched POIs: {len(all_results)} (covered: {covered_count}, "
+            f"neighboring: {neighboring_count}, isolated: {isolated_count})"
+        )
+
+        return all_results
 
 
 # 2026-02-11 06:45:12,593 - INFO - Sample poi: [{'id': 0, 'coords': [(2150.8059514097986, 686.7657546492173)], 'name': 'Carrefour', 'category': 'amenity|fuel', 'external': {'name': 'Carrefour', 'catg': 'amenity|fuel'}}, {'id': 1, 'coords': [(-1767.8153798340832, 2471.9105316358464)], 'name': "Mairie d'Igny", 'category': 'amenity|townhall', 'external': {'name': "Mairie d'Igny", 'catg': 'amenity|townhall'}}].
