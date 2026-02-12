@@ -4,7 +4,10 @@ import pandas as pd
 import tempfile
 import atexit
 import os
+from shapely import wkt as shapely_wkt
 from tqdm import tqdm
+from shapely.geometry import Polygon, MultiPolygon
+
 
 class SpatialDB:
     def __init__(self, memory_limit="64GB"):
@@ -177,7 +180,9 @@ class SpatialDB:
         total_pois = self.con.execute("SELECT COUNT(*) FROM pois").fetchone()[0]
         logging.info(f"Processing {total_pois} POIs in batches of {batch_size}")
 
-        for offset in tqdm(range(0, total_pois, batch_size), desc="Matching POIs to AOIs"):
+        for offset in tqdm(
+            range(0, total_pois, batch_size), desc="Matching POIs to AOIs"
+        ):
             logging.info(
                 f"Processing POI batch {offset} to {min(offset + batch_size, total_pois)}"
             )
@@ -314,7 +319,338 @@ class SpatialDB:
 
         return all_results
 
+    def merge_covered_aois_duckdb(
+        self,
+        aois: list[dict],
+        aoi_merge_grid: float = 15_000,
+        cover_gate: float = 0.8,
+        simplify_tolerance: float = 0.1,
+    ) -> list[dict]:
+        """
+        Merge covered AOIs using DuckDB spatial operations to avoid multiprocessing serialization issues.
 
-# 2026-02-11 06:45:12,593 - INFO - Sample poi: [{'id': 0, 'coords': [(2150.8059514097986, 686.7657546492173)], 'name': 'Carrefour', 'category': 'amenity|fuel', 'external': {'name': 'Carrefour', 'catg': 'amenity|fuel'}}, {'id': 1, 'coords': [(-1767.8153798340832, 2471.9105316358464)], 'name': "Mairie d'Igny", 'category': 'amenity|townhall', 'external': {'name': "Mairie d'Igny", 'catg': 'amenity|townhall'}}].
+        Args:
+            aois: List of AOI dictionaries with 'geo' (Shapely geometry) and other metadata
+            aoi_merge_grid: Grid size for spatial partitioning
+            cover_gate: Coverage threshold for determining if an AOI is contained
+            simplify_tolerance: Tolerance for simplifying geometries
 
-#  Sample aoi: [{'id': 0, 'coords': [(-415.66671420305437, 895.4331339390087), (-391.90378178541846, 895.9874454271227), (-363.5794555993215, 898.0984225735215), (-346.06999085623033, 897.6524969421165), (-352.17490207946963, 919.0041349268339), (-362.7668701462501, 949.4748356649122), (-373.8733522090645, 985.1722027834993), (-376.74178554330445, 995.9592295845381), (-383.8778369597901, 996.6269404030702), (-407.64077865025456, 990.0675527703313), (-446.1177293071916, 979.5060556964389), (-448.61912019256, 978.616619382788), (-448.9874421381907, 972.6116069111966), (-447.15016705841595, 948.3688839515622), (-443.3265934394976, 923.1251649121397), (-437.5169092893462, 894.1003423305511), (-415.66671420305437, 895.4331339390087)], 'external': {'population': 0, 'inner_poi': [], 'inner_poi_catg': [], 'osm_tags': [{'access': 'customers', 'amenity': 'parking', 'fee': 'no', 'parking': 'surface'}], 'land_types': {}}, 'geo': <POLYGON ((-415.667 895.433, -391.904 895.987, -363.579 898.098, -346.07 897...>, 'point': (-401.6432523418365, 940.9277419949635), 'length': 354.4263265354603, 'area': 7853.709629768692}, {'id': 1, 'coords': [(-1734.023854801422, 2102.0330848057083), (-1774.2365399995942, 2168.6572773231665), (-1777.25039985689, 2174.32967157472), (-1778.0533057121618, 2193.790748759174), (-1782.3117024715627, 2217.812317124781), (-1781.4282658998513, 2220.369744580731), (-1759.6551780465995, 2225.811898721131), (-1670.4300216273982, 2248.359158206605), (-1664.919267343975, 2229.4527183630457), (-1666.9054643833172, 2228.45246622369), (-1668.1562097356348, 2227.229586483407), (-1667.7154278789683, 2225.4501800326475), (-1667.4216503291095, 2224.004431462702), (-1665.5097964217666, 2222.3357925498385), (-1662.7885071396186, 2221.890165916644), (-1648.0191490581656, 2172.288507875898), (-1651.3293755366694, 2171.066230281592), (-1653.4633192162935, 2167.953127748629), (-1652.6551581001108, 2164.839157959759), (-1651.9203849662065, 2162.2812334025107), (-1648.243272448187, 2160.5008759852685), (-1644.933301439642, 2160.833517897433), (-1635.160615924976, 2127.1356372881705), (-1677.9716584413577, 2116.8062513364125), (-1676.8697890701303, 2112.0241200978116), (-1688.1243591070966, 2109.0249711712227), (-1689.4468460056335, 2113.9183757694595), (-1732.6262695013045, 2102.2550620783586), (-1734.023854801422, 2102.0330848057083)], 'external': {'population': 0, 'inner_poi': [], 'inner_poi_catg': [], 'osm_tags': [{'landuse': 'cemetery', 'name': "Cimetière Communal d'Igny", 'opening_hours': 'Nov-Mar 08:45-17:30;Apr-Oct 8:45-19:00', 'wikidata': 'Q110338395'}], 'land_types': {}}, 'geo': <POLYGON ((-1734.024 2102.033, -1774.237 2168.657, -1777.25 2174.33, -1778.0...>, 'point': (-1709.346762397296, 2174.826715920955), 'length': 496.80382825388784, 'area': 14466.088159117811}]
+        Returns:
+            List of merged AOI dictionaries
+        """
+        logging.info("Merging Covered AOI using DuckDB")
+
+        # Prepare data for DuckDB
+        aois_data = []
+        for idx, aoi in enumerate(aois):
+            geo = aoi["geo"]
+            centroid = geo.centroid
+
+            aois_data.append(
+                {
+                    "idx": idx,
+                    "wkt": geo.wkt,
+                    "centroid_x": centroid.x,
+                    "centroid_y": centroid.y,
+                    "area": geo.area,
+                    "length": geo.length,
+                    "is_valid": geo.is_valid,
+                    "grid_x": int(centroid.x // aoi_merge_grid),
+                    "grid_y": int(centroid.y // aoi_merge_grid),
+                    # Store metadata as JSON for preservation
+                    "external": str(aoi.get("external", {})),
+                    "id": aoi.get("id", -1),
+                }
+            )
+
+        # Create DataFrame and register with DuckDB
+        df = pd.DataFrame(aois_data)
+        self.con.register("aois_temp", df)
+
+        # Create AOI table with geometries
+        logging.info("Creating AOI spatial table")
+        self.con.execute(
+            """
+            CREATE OR REPLACE TABLE aois_spatial AS
+            SELECT 
+                idx,
+                ST_GeomFromText(wkt) AS geom,
+                centroid_x,
+                centroid_y,
+                area,
+                length,
+                is_valid,
+                grid_x,
+                grid_y,
+                external,
+                id
+            FROM aois_temp
+        """
+        )
+
+        # Create spatial index
+        self.con.execute("CREATE INDEX idx_aois_geom ON aois_spatial USING RTREE(geom)")
+
+        # Find parent-child relationships using SQL
+        logging.info("Finding parent-child relationships")
+        SQRT2 = 2**0.5
+
+        self.con.execute(
+            f"""
+            CREATE OR REPLACE TABLE aoi_parents AS
+            WITH aoi_pairs AS (
+                SELECT 
+                    a1.idx AS child_idx,
+                    a2.idx AS parent_idx,
+                    a1.area AS child_area,
+                    a2.area AS parent_area,
+                    a1.geom AS child_geom,
+                    a2.geom AS parent_geom,
+                    a1.centroid_x AS child_x,
+                    a1.centroid_y AS child_y,
+                    a2.centroid_x AS parent_x,
+                    a2.centroid_y AS parent_y,
+                    a2.length AS parent_length,
+                    a1.is_valid AS child_valid,
+                    a2.is_valid AS parent_valid
+                FROM aois_spatial a1
+                JOIN aois_spatial a2 
+                    ON a1.grid_x = a2.grid_x 
+                    AND a1.grid_y = a2.grid_y
+                    AND a1.idx != a2.idx
+                    AND a2.area > a1.area
+                    AND a1.is_valid = true
+                    AND a2.is_valid = true
+            ),
+            covered_aois AS (
+                SELECT 
+                    child_idx,
+                    parent_idx,
+                    child_area,
+                    ST_Area(ST_Intersection(child_geom, parent_geom)) AS intersection_area
+                FROM aoi_pairs
+                WHERE {SQRT2} * (ABS(child_x - parent_x) + ABS(child_y - parent_y)) < parent_length
+                    AND child_valid AND parent_valid
+            )
+            SELECT 
+                child_idx AS idx,
+                FIRST(parent_idx) AS parent,
+                true AS has_parent
+            FROM covered_aois
+            WHERE intersection_area > {cover_gate} * child_area
+            GROUP BY child_idx
+        """
+        )
+
+        # Get results
+        logging.info("Processing parent-child relationships")
+        parent_info = self.con.execute(
+            """
+            SELECT idx, parent, has_parent
+            FROM aoi_parents
+        """
+        ).fetchall()
+
+        # Build parent mapping
+        child2parent = {row[0]: row[1] for row in parent_info}
+
+        # Resolve transitive parent relationships
+        for child, parent in list(child2parent.items()):
+            while parent in child2parent:
+                parent = child2parent[parent]
+            child2parent[child] = parent
+
+        # Group children by parent
+        from collections import defaultdict
+
+        parent2children = defaultdict(list)
+        for child, parent in child2parent.items():
+            parent2children[parent].append(child)
+
+        # Update parent AOIs with merged data
+        logging.info("Merging child AOI data into parents")
+        for parent_idx, children_indices in parent2children.items():
+            parent_aoi = aois[parent_idx]
+            external = parent_aoi.get("external", {})
+
+            if "inner_poi" not in external:
+                external["inner_poi"] = []
+            if "population" not in external:
+                external["population"] = 0
+            if "land_types" not in external:
+                external["land_types"] = {}
+            if "names" not in external:
+                external["names"] = {}
+
+            for child_idx in children_indices:
+                child_aoi = aois[child_idx]
+                child_external = child_aoi.get("external", {})
+
+                external["inner_poi"].extend(child_external.get("inner_poi", []))
+                external["population"] += child_external.get("population", 0)
+
+                for land_type, area in child_external.get("land_types", {}).items():
+                    external["land_types"][land_type] = (
+                        external["land_types"].get(land_type, 0) + area
+                    )
+
+                for name, area in child_external.get("names", {}).items():
+                    external["names"][name] = external["names"].get(name, 0) + area
+
+            parent_aoi["external"] = external
+
+        # Filter out children, keep only parents
+        has_parent_set = set(child2parent.keys())
+        aois_filtered = [
+            aoi for idx, aoi in enumerate(aois) if idx not in has_parent_set
+        ]
+
+        logging.info(
+            f"Reduced from {len(aois)} to {len(aois_filtered)} AOIs after merging"
+        )
+
+        # Now find overlaps
+        logging.info("Finding overlapping AOIs")
+
+        # Re-index filtered AOIs
+        for new_idx, aoi in enumerate(aois_filtered):
+            aoi["idx"] = new_idx
+
+        # Create new table with filtered AOIs
+        aois_filtered_data = []
+        for aoi in aois_filtered:
+            geo = aoi["geo"]
+            centroid = geo.centroid
+            aois_filtered_data.append(
+                {
+                    "idx": aoi["idx"],
+                    "wkt": geo.wkt,
+                    "centroid_x": centroid.x,
+                    "centroid_y": centroid.y,
+                    "area": geo.area,
+                    "length": geo.length,
+                    "is_valid": geo.is_valid,
+                    "grid_x": int(centroid.x // aoi_merge_grid),
+                    "grid_y": int(centroid.y // aoi_merge_grid),
+                }
+            )
+
+        df_filtered = pd.DataFrame(aois_filtered_data)
+        self.con.register("aois_filtered_temp", df_filtered)
+
+        self.con.execute(
+            """
+            CREATE OR REPLACE TABLE aois_filtered AS
+            SELECT 
+                idx,
+                ST_GeomFromText(wkt) AS geom,
+                centroid_x,
+                centroid_y,
+                area,
+                length,
+                is_valid,
+                grid_x,
+                grid_y
+            FROM aois_filtered_temp
+        """
+        )
+
+        # Find overlaps
+        self.con.execute(
+            f"""
+            CREATE OR REPLACE TABLE aoi_overlaps AS
+            SELECT 
+                a1.idx AS aoi_idx,
+                a2.idx AS overlap_idx
+            FROM aois_filtered a1
+            JOIN aois_filtered a2 
+                ON a1.grid_x = a2.grid_x 
+                AND a1.grid_y = a2.grid_y
+                AND a1.idx != a2.idx
+                AND a2.area > a1.area
+                AND a1.is_valid = true
+                AND a2.is_valid = true
+            WHERE {SQRT2} * (ABS(a1.centroid_x - a2.centroid_x) + ABS(a1.centroid_y - a2.centroid_y)) 
+                < 2 * (a1.length + a2.length)
+                AND ST_Intersects(a1.geom, a2.geom)
+        """
+        )
+
+        # Get overlap information
+        overlap_results = self.con.execute(
+            """
+            SELECT aoi_idx, overlap_idx
+            FROM aoi_overlaps
+            ORDER BY aoi_idx, overlap_idx
+        """
+        ).fetchall()
+
+        # Build overlap dictionary
+        aoi_overlaps = defaultdict(list)
+        for aoi_idx, overlap_idx in overlap_results:
+            aoi_overlaps[aoi_idx].append(overlap_idx)
+
+        # Add overlaps to AOI objects
+        for aoi in aois_filtered:
+            aoi["overlaps"] = aoi_overlaps.get(aoi["idx"], [])
+
+        # Process overlaps - cut overlapping geometries
+        logging.info("Processing overlapping geometries")
+        has_overlap_aids = defaultdict(list)
+        for i, aoi in enumerate(aois_filtered):
+            for j in aoi["overlaps"]:
+                has_overlap_aids[j].append(i)
+
+        # Use DuckDB for geometry difference operations
+        for i, aids in tqdm(has_overlap_aids.items(), desc="Cutting overlaps"):
+            aoi = aois_filtered[i]
+            for j in aids:
+                overlap_aoi = aois_filtered[j]
+
+                # Use DuckDB for difference operation
+                try:
+                    result = self.con.execute(
+                        f"""
+                        SELECT ST_AsText(ST_Difference(
+                            ST_GeomFromText('{aoi["geo"].wkt}'),
+                            ST_GeomFromText('{overlap_aoi["geo"].wkt}')
+                        )) AS diff_wkt
+                    """
+                    ).fetchone()
+
+                    if result and result[0]:
+
+                        diff_geo = shapely_wkt.loads(result[0])
+
+                        if diff_geo and not diff_geo.is_empty:
+
+                            if isinstance(diff_geo, Polygon):
+                                aoi["geo"] = diff_geo
+                            elif isinstance(diff_geo, MultiPolygon):
+                                # Take the largest part
+                                candidate_geos = [
+                                    (p.area, p) for p in diff_geo.geoms if p
+                                ]
+                                if candidate_geos:
+                                    aoi["geo"] = max(
+                                        candidate_geos, key=lambda x: x[0]
+                                    )[1]
+                except Exception as e:
+                    logging.warning(f"Failed to compute difference for AOI {i}: {e}")
+                    continue
+
+        # Cleanup
+        try: 
+          self.con.execute("DROP TABLE IF EXISTS aois_temp")
+          self.con.execute("DROP TABLE IF EXISTS aois_spatial")
+          self.con.execute("DROP TABLE IF EXISTS aoi_parents")
+          self.con.execute("DROP TABLE IF EXISTS aois_filtered_temp")
+          self.con.execute("DROP TABLE IF EXISTS aois_filtered")
+          self.con.execute("DROP TABLE IF EXISTS aoi_overlaps")
+        except Exception as e:
+          logging.warning(f"Failed to clean up temporary tables: {e}")
+
+        logging.info(f"Final AOI count: {len(aois_filtered)}")
+        return aois_filtered
+
+

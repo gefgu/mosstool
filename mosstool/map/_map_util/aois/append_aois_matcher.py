@@ -9,6 +9,8 @@ from typing import Any, Optional
 import geopandas as gpd
 import numpy as np
 import shapely.ops as ops
+
+from ....spatial_db.spatial_db import SpatialDB
 from scipy.spatial import KDTree
 from shapely.affinity import scale
 from shapely.geometry import (LineString, MultiLineString, MultiPoint,
@@ -1527,120 +1529,24 @@ def _add_pois(aois, pois):
 
 
 def _merge_covered_aoi(
-    aois: list, workers: int, max_chunk_size: int, enable_tqdm: bool
+    aois: list
 ):
     """
     Blend the contained small poly aoi into the large poly aoi
     At the same time, cut off the overlapping parts between aoi
     """
-    logging.info("Merging Covered Aoi")
-    # Pre-compute geometric properties
-    grid_idx_2_aois: dict[tuple, list[dict]] = defaultdict(list)
-    for idx, aoi in enumerate(aois):
-        geo = aoi["geo"]
-        aoi["point"] = geo_coords(geo.centroid)[0]  # Geometric center
-        aoi["length"] = geo.length  # Perimeter
-        aoi["area"] = geo.area  # area
-        aoi["valid"] = geo.is_valid
-        aoi["idx"] = idx
-        grid_idx = tuple(x // AOI_MERGE_GRID for x in aoi["point"])
-        aoi["grid_idx"] = grid_idx
-        grid_idx_2_aois[grid_idx].append(aoi)
-
-    aois_result = []
-    for grid_idx, _aois in tqdm(grid_idx_2_aois.items(), disable=not enable_tqdm):
-        aois_to_merge: list[dict] = _aois
-        partial_find_aoi_parent_unit = partial(_find_aoi_parent_unit, (aois_to_merge,))
-        for i in range(0, len(_aois), MAX_BATCH_SIZE):
-            aois_batch = _aois[i : i + MAX_BATCH_SIZE]
-            with Pool(processes=workers) as pool:
-                aois_result += pool.map(
-                    partial_find_aoi_parent_unit,
-                    aois_batch,
-                    chunksize=min(ceil(len(aois_batch) / workers), max_chunk_size),
-                )
-    aois = sorted(aois_result, key=lambda aoi: aoi["idx"])
-    parent2children = defaultdict(list)
-    child2parent = {}
-    for i, aoi in enumerate(aois):
-        if aoi["has_parent"]:
-            child2parent[i] = aoi["parent"]
-    for child, parent in child2parent.items():
-        while parent in child2parent.keys():
-            parent = child2parent[parent]
-        parent2children[parent].append(child)
-    for parent, children in parent2children.items():
-        aoi_parent = aois[parent]
-        external = aoi_parent["external"]
-        if "inner_poi" not in aoi_parent["external"]:
-            external["inner_poi"] = []
-        if "population" not in aoi_parent["external"]:
-            external["population"] = 0
-        for c in children:
-            a = aois[c]
-            external["inner_poi"] += a["external"].get("inner_poi", [])
-            external["population"] += a["external"].get("population", 0)
-            child_land_types = external["land_types"]
-            child_names = external["names"]
-            for land_type, area in child_land_types.items():
-                external["land_types"][land_type] += area
-            for child_name, area in child_names.items():
-                external["names"][child_name] += area
-    aois = [a for a in aois if not a["has_parent"]]
-    grid_idx_2_aois: dict[tuple, list[dict]] = defaultdict(list)
-    for idx, aoi in enumerate(aois):
-        aoi["idx"] = idx
-        grid_idx_2_aois[aoi["grid_idx"]].append(aoi)
-    aois_result = []
-    for grid_idx, _aois in tqdm(grid_idx_2_aois.items(), disable=not enable_tqdm):
-        aois_with_overlap: list[dict] = _aois
-        partial_args = (aois_with_overlap,)
-        partial_find_aoi_overlap_unit = partial(_find_aoi_overlap_unit, partial_args)
-        for i in range(0, len(_aois), MAX_BATCH_SIZE):
-            aois_batch = _aois[i : i + MAX_BATCH_SIZE]
-            with Pool(processes=workers) as pool:
-                aois_result += pool.map(
-                    partial_find_aoi_overlap_unit,
-                    aois_batch,
-                    chunksize=max(
-                        min(ceil(len(aois_batch) / workers), max_chunk_size),
-                        1,
-                    ),
-                )
-    aois = aois_result
-    # get difference set of larger aoi
-    has_overlap_aids = defaultdict(list)
-    for i, aoi in enumerate(aois):
-        for j in aoi["overlaps"]:
-            has_overlap_aids[j].append(i)
-    for i, aids in has_overlap_aids.items():
-        aoi = aois[i]
-        for j in aids:
-            geo = aoi["geo"]
-            overlap_geo = aois[j]["geo"]
-            diff_geo_i = geo.difference(overlap_geo)
-            diff_geo_j = overlap_geo.difference(geo)
-            if diff_geo_i:
-                if isinstance(diff_geo_i, Polygon):
-                    aoi["geo"] = diff_geo_i
-                    continue
-                elif isinstance(diff_geo_i, MultiPolygon):
-                    # AOI may be cut off, take the part with the largest area
-                    candidate_geos = [(p.area, p) for p in diff_geo_i.geoms if p]
-                    if candidate_geos:
-                        aoi["geo"] = max(candidate_geos, key=lambda x: x[0])[1]
-                        continue
-            if diff_geo_j:
-                if isinstance(diff_geo_j, Polygon):
-                    aois[j]["geo"] = diff_geo_j
-                    continue
-                elif isinstance(diff_geo_j, MultiPolygon):
-                    # AOI may be cut off, take the part with the largest area
-                    candidate_geos = [(p.area, p) for p in diff_geo_j.geoms if p]
-                    if candidate_geos:
-                        aois[j]["geo"] = max(candidate_geos, key=lambda x: x[0])[1]
-                        continue
-    return aois
+    logging.info("Merging Covered Aoi using DuckDB")
+    
+    # Use DuckDB-based spatial operations instead of multiprocessing
+    sp_db = SpatialDB()
+    merged_aois = sp_db.merge_covered_aois_duckdb(
+        aois=aois,
+        aoi_merge_grid=AOI_MERGE_GRID,
+        cover_gate=0.8,
+        simplify_tolerance=0.1,
+    )
+    
+    return merged_aois
 
 
 def _add_aoi(
@@ -1745,7 +1651,7 @@ def _add_aoi(
     aois_poly.extend(aois_poi)
 
     if merge_aoi:
-        aois_poly = _merge_covered_aoi(aois_poly, workers, max_chunk_size, enable_tqdm)
+        aois_poly = _merge_covered_aoi(aois_poly)
     # The convex hull may fail, check it
     for a in aois_poly:
         assert isinstance(a["geo"], Polygon)
