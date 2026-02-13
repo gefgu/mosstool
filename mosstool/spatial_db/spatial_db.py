@@ -640,17 +640,316 @@ class SpatialDB:
                     continue
 
         # Cleanup
-        try: 
-          self.con.execute("DROP TABLE IF EXISTS aois_temp")
-          self.con.execute("DROP TABLE IF EXISTS aois_spatial")
-          self.con.execute("DROP TABLE IF EXISTS aoi_parents")
-          self.con.execute("DROP TABLE IF EXISTS aois_filtered_temp")
-          self.con.execute("DROP TABLE IF EXISTS aois_filtered")
-          self.con.execute("DROP TABLE IF EXISTS aoi_overlaps")
+        try:
+            self.con.execute("DROP TABLE IF EXISTS aois_temp")
+            self.con.execute("DROP TABLE IF EXISTS aois_spatial")
+            self.con.execute("DROP TABLE IF EXISTS aoi_parents")
+            self.con.execute("DROP TABLE IF EXISTS aois_filtered_temp")
+            self.con.execute("DROP TABLE IF EXISTS aois_filtered")
+            self.con.execute("DROP TABLE IF EXISTS aoi_overlaps")
         except Exception as e:
-          logging.warning(f"Failed to clean up temporary tables: {e}")
+            logging.warning(f"Failed to clean up temporary tables: {e}")
 
         logging.info(f"Final AOI count: {len(aois_filtered)}")
         return aois_filtered
 
+    def match_aois_to_lanes_duckdb(
+        self,
+        aois: list[dict],
+        d_matcher: list[dict],
+        w_matcher: list[dict],
+        d_dis_gate: float,
+        w_dis_gate: float,
+        aoi_type: int,
+        batch_size: int = 5000,
+    ) -> list[dict]:
+        """
+        Match AOIs to driving and walking lanes using DuckDB spatial operations.
+        Replaces the multiprocessing-based _add_poly_aoi_unit approach.
 
+        Args:
+            aois: List of AOI dictionaries with 'geo' (Shapely geometry)
+            d_matcher: List of driving lane dictionaries
+            w_matcher: List of walking lane dictionaries
+            d_dis_gate: Distance threshold for driving lanes
+            w_dis_gate: Distance threshold for walking lanes
+            aoi_type: AOI type constant
+            batch_size: Number of AOIs to process per batch
+
+        Returns:
+            List of matched AOI dictionaries with positions and gates
+        """
+        from collections import defaultdict
+        from shapely.geometry import Point
+        import shapely.ops as ops
+
+        logging.info(
+            f"Matching {len(aois)} AOIs to {len(d_matcher)} driving and {len(w_matcher)} walking lanes using DuckDB"
+        )
+
+        # Prepare AOI data with GLOBAL indices
+        aois_data = []
+        for idx, aoi in enumerate(aois):
+            geo = aoi["geo"]
+            aois_data.append(
+                {
+                    "global_idx": idx,  # Keep track of global index
+                    "wkt": geo.wkt,
+                    "area": geo.area,
+                }
+            )
+
+        aois_df = pd.DataFrame(aois_data)
+        self.con.register("aois_match_temp", aois_df)
+
+        # Create AOI table
+        self.con.execute(
+            """
+            CREATE OR REPLACE TABLE aois_match AS
+            SELECT 
+                global_idx,
+                ST_GeomFromText(wkt) AS geom,
+                area
+            FROM aois_match_temp
+        """
+        )
+
+        # Prepare lane data (driving)
+        d_lanes_data = []
+        for lane in d_matcher:
+            d_lanes_data.append(
+                {
+                    "id": lane["id"],
+                    "wkt": lane["geo"].wkt,
+                    "length": lane["length"],
+                }
+            )
+
+        d_lanes_df = pd.DataFrame(d_lanes_data)
+        self.con.register("d_lanes_temp", d_lanes_df)
+
+        self.con.execute(
+            """
+            CREATE OR REPLACE TABLE d_lanes AS
+            SELECT 
+                id,
+                ST_GeomFromText(wkt) AS geom,
+                length
+            FROM d_lanes_temp
+        """
+        )
+
+        # Prepare lane data (walking)
+        w_lanes_data = []
+        for lane in w_matcher:
+            w_lanes_data.append(
+                {
+                    "id": lane["id"],
+                    "wkt": lane["geo"].wkt,
+                    "length": lane["length"],
+                }
+            )
+
+        w_lanes_df = pd.DataFrame(w_lanes_data)
+        self.con.register("w_lanes_temp", w_lanes_df)
+
+        self.con.execute(
+            """
+            CREATE OR REPLACE TABLE w_lanes AS
+            SELECT 
+                id,
+                ST_GeomFromText(wkt) AS geom,
+                length
+            FROM w_lanes_temp
+        """
+        )
+
+        # Create spatial indices
+        self.con.execute(
+            "CREATE INDEX idx_aois_match_geom ON aois_match USING RTREE(geom)"
+        )
+        self.con.execute("CREATE INDEX idx_d_lanes_geom ON d_lanes USING RTREE(geom)")
+        self.con.execute("CREATE INDEX idx_w_lanes_geom ON w_lanes USING RTREE(geom)")
+
+        results = []
+        total_aois = len(aois)
+
+        # Create index lookup for matchers
+        d_matcher_dict = {lane["id"]: lane for lane in d_matcher}
+        w_matcher_dict = {lane["id"]: lane for lane in w_matcher}
+
+        for offset in tqdm(
+            range(0, total_aois, batch_size), desc="Matching AOIs to lanes"
+        ):
+            # Get basic matches within distance threshold for driving lanes
+            d_matches_basic = self.con.execute(
+                f"""
+                WITH batch_aois AS (
+                    SELECT global_idx, geom, area
+                    FROM aois_match
+                    WHERE global_idx >= {offset} AND global_idx < {offset + batch_size}
+                )
+                SELECT 
+                    a.global_idx AS aoi_idx,
+                    l.id AS lane_id,
+                    ST_AsText(a.geom) AS aoi_wkt,
+                    ST_Distance(a.geom, l.geom) AS distance
+                FROM batch_aois a
+                JOIN d_lanes l ON ST_DWithin(a.geom, l.geom, {d_dis_gate})
+            """
+            ).fetchall()
+
+            # Get basic matches within distance threshold for walking lanes
+            w_matches_basic = self.con.execute(
+                f"""
+                WITH batch_aois AS (
+                    SELECT global_idx, geom, area
+                    FROM aois_match
+                    WHERE global_idx >= {offset} AND global_idx < {offset + batch_size}
+                )
+                SELECT 
+                    a.global_idx AS aoi_idx,
+                    l.id AS lane_id,
+                    ST_AsText(a.geom) AS aoi_wkt,
+                    ST_Distance(a.geom, l.geom) AS distance
+                FROM batch_aois a
+                JOIN w_lanes l ON ST_DWithin(a.geom, l.geom, {w_dis_gate})
+            """
+            ).fetchall()
+
+            # Process matches using Shapely (which has the full set of operations)
+            d_matches_by_aoi = defaultdict(list)
+            for aoi_idx, lane_id, aoi_wkt, distance in d_matches_basic:
+                lane = d_matcher_dict[lane_id]
+                aoi_geom = shapely_wkt.loads(aoi_wkt)
+
+                # Use Shapely's nearest_points
+                p_aoi, p_lane = ops.nearest_points(aoi_geom, lane["geo"])
+
+                # Project the point on the lane
+                s = lane["geo"].project(p_lane)
+
+                # Skip if at start or end
+                if s <= 0 or s >= lane["length"]:
+                    continue
+
+                # Adjust s if too close to boundaries
+                if s < 1:
+                    s = min(1, lane["length"] / 2)
+                if s > lane["length"] - 1:
+                    s = max(lane["length"] - 1, lane["length"] / 2)
+
+                d_matches_by_aoi[aoi_idx].append(
+                    (lane_id, s, (p_aoi.x, p_aoi.y), (p_lane.x, p_lane.y), distance)
+                )
+
+            w_matches_by_aoi = defaultdict(list)
+            for aoi_idx, lane_id, aoi_wkt, distance in w_matches_basic:
+                lane = w_matcher_dict[lane_id]
+                aoi_geom = shapely_wkt.loads(aoi_wkt)
+
+                # Use Shapely's nearest_points
+                p_aoi, p_lane = ops.nearest_points(aoi_geom, lane["geo"])
+
+                # Project the point on the lane
+                s = lane["geo"].project(p_lane)
+
+                # Skip if at start or end
+                if s <= 0 or s >= lane["length"]:
+                    continue
+
+                # Adjust s if too close to boundaries
+                if s < 1:
+                    s = min(1, lane["length"] / 2)
+                if s > lane["length"] - 1:
+                    s = max(lane["length"] - 1, lane["length"] / 2)
+
+                w_matches_by_aoi[aoi_idx].append(
+                    (lane_id, s, (p_aoi.x, p_aoi.y), (p_lane.x, p_lane.y), distance)
+                )
+
+            # Process batch results using GLOBAL indices
+            batch_start_idx = offset
+            batch_end_idx = min(offset + batch_size, total_aois)
+
+            for global_idx in range(batch_start_idx, batch_end_idx):
+                aoi = aois[global_idx]
+
+                d_matched = d_matches_by_aoi.get(global_idx, [])  # ✅ Use global_idx
+                w_matched = w_matches_by_aoi.get(global_idx, [])  # ✅ Use global_idx
+
+                if d_matched or w_matched:
+                    geo = aoi["geo"]
+                    base_aoi = {
+                        "id": 0,  # Will be assigned after all processing
+                        "type": aoi_type,
+                        "positions": [
+                            {"x": c[0], "y": c[1]} for c in geo.exterior.coords
+                        ],
+                        "area": geo.area,
+                        "external": {
+                            "osm_input_ids": [aoi["id"]],
+                            "ex_poi_ids": aoi["external"].get("inner_poi", []),
+                            "population": aoi["external"].get("population", 0),
+                            "land_types": aoi["external"].get(
+                                "land_types", defaultdict(float)
+                            ),
+                            "names": aoi["external"].get("names", defaultdict(float)),
+                        },
+                    }
+
+                    # Process matched results (same logic as _process_matched_result)
+                    (
+                        d_positions,
+                        d_gates,
+                        d_externals,
+                        w_positions,
+                        w_gates,
+                        w_externals,
+                    ) = ([], [], [], [], [], [])
+
+                    for lane_id, s, (x_gate, y_gate), (x, y), dis in d_matched:
+                        d_positions.append({"lane_id": lane_id, "s": s})
+                        d_gates.append({"x": x_gate, "y": y_gate})
+                        d_externals.append((dis, {"x": x, "y": y}))
+
+                    for lane_id, s, (x_gate, y_gate), (x, y), dis in w_matched:
+                        w_positions.append({"lane_id": lane_id, "s": s})
+                        w_gates.append({"x": x_gate, "y": y_gate})
+                        w_externals.append((dis, {"x": x, "y": y}))
+
+                    base_aoi["driving_positions"] = d_positions
+                    base_aoi["driving_gates"] = d_gates
+                    if d_positions:
+                        base_aoi["external"]["driving_distances"] = [
+                            x[0] for x in d_externals
+                        ]
+                        base_aoi["external"]["driving_lane_project_point"] = [
+                            x[1] for x in d_externals
+                        ]
+
+                    base_aoi["walking_positions"] = w_positions
+                    base_aoi["walking_gates"] = w_gates
+                    if w_positions:
+                        base_aoi["external"]["walking_distances"] = [
+                            x[0] for x in w_externals
+                        ]
+                        base_aoi["external"]["walking_lane_project_point"] = [
+                            x[1] for x in w_externals
+                        ]
+
+                    results.append(base_aoi)
+
+        # Cleanup
+        try:
+            self.con.execute("DROP TABLE IF EXISTS aois_match_temp")
+            self.con.execute("DROP TABLE IF EXISTS aois_match")
+            self.con.execute("DROP TABLE IF EXISTS d_lanes_temp")
+            self.con.execute("DROP TABLE IF EXISTS d_lanes")
+            self.con.execute("DROP TABLE IF EXISTS w_lanes_temp")
+            self.con.execute("DROP TABLE IF EXISTS w_lanes")
+        except Exception as e:
+            logging.warning(f"Failed to clean up temporary tables: {e}")
+
+        logging.info(f"Matched {len(results)} AOIs to lanes")
+        return results

@@ -1691,28 +1691,16 @@ def _add_aoi(
             )
     results_stop = [r for r in results_stop if r]
     logging.info(f"matched aois_stop: {len(results_stop)}")
-    results_poly = []
-    args = [(aoi, AoiType.AOI_TYPE_OTHER) for aoi in aois_poly]
-
-    partial_args = (
-        d_matcher,
-        w_matcher,
-        d_tree,
-        w_tree,
-        d_dis_gate,
-        w_dis_gate,
-        W_HUGE_GATE,
+    sp_db = SpatialDB()
+    results_poly = sp_db.match_aois_to_lanes_duckdb(
+        aois=aois_poly,
+        d_matcher=d_matcher,
+        w_matcher=w_matcher,
+        d_dis_gate=d_dis_gate,
+        w_dis_gate=w_dis_gate,
+        aoi_type=AoiType.AOI_TYPE_OTHER,
+        batch_size=5000,
     )
-    partial_add_poly_aoi_unit = partial(_add_poly_aoi_unit, partial_args)
-    for i in tqdm(range(0, len(args), MAX_BATCH_SIZE), disable=not enable_tqdm):
-        args_batch = args[i : i + MAX_BATCH_SIZE]
-        with Pool(processes=workers) as pool:
-            results_poly += pool.map(
-                partial_add_poly_aoi_unit,
-                args_batch,
-                chunksize=min(ceil(len(args_batch) / workers), max_chunk_size),
-            )
-    results_poly = [r for r in results_poly if r]
     logging.info(f"matched aois_poly: {len(results_poly)}")
 
     # Post-compute
