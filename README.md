@@ -2,7 +2,7 @@
 
 MObility Simulation System (MOSS) Toolbox
 
-## Highlights
+## My Highlights
 
 - Builds road networks, buildings, AOIs, POIs, and trip inputs for MOSS simulations.
 - Uses DuckDB spatial operations for POI-to-AOI matching, covered-AOI merging, and AOI-to-lane matching, improving scalability on large maps.
@@ -17,4 +17,4 @@ pip install mosstool
 
 More basic concept introductions and tutorials are available at [MOSS](https://moss.fiblab.net/docs/introduction)
 
-GitHub Repo: [https://github.com/tsinghua-fib-lab/mosstool](https://github.com/tsinghua-fib-lab/mosstool)
+Original GitHub Repo: [https://github.com/tsinghua-fib-lab/mosstool](https://github.com/tsinghua-fib-lab/mosstool)
